@@ -1,0 +1,449 @@
+#!/usr/bin/perl -w
+
+# FUTURE ENHANCEMENTS
+# -------------------
+# Add functionality to allow spaces in usernames and/or groups
+# Test additional UNIX/Linux flavours
+
+
+ 
+# CHANGE LOG
+# ----------
+#  2025/12/04	njeffrey	Script created
+
+
+# NOTES
+# -----
+#  This script will alert if the membership of a specific group changes
+#
+#  Tested on RHEL8,9 Ubuntu 24.04.  Expected to work on any UNIX-like system with getent
+#
+#
+#  This script is executed remotely on a monitored system by the NRPE or check_by_ssh
+#  methods available in nagios.
+#
+#  If you are using the check_by_ssh method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking time synchronization
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             group MyTestGroup
+#           check_command                   check_by_ssh!"/usr/local/nagios/libexec/check_group"
+#           }
+#
+#  If you are using the check_nrpe method, you will need a section in the services.cfg
+#  file on the nagios server that looks similar to the following.
+#  This assumes that you already have ssh key pairs configured.
+#   # Define service for checking time synchronization
+#   define service{
+#           use                             generic-24x7-service
+#           host_name                       unix11
+#           service_description             group MyTestGroup
+#           check_command                   check_nrpe!check_group -t 30
+#           }
+#
+#  If using NRPE, you will also need a section defining the NRPE command in the /usr/local/nagios/nrpe.cfg file that looks like this:
+#   command[check_group]=/usr/local/nagios/libexec/check_group
+#
+
+
+
+
+# ASSUMPTIONS
+# -----------
+#  It is assumed that perl is installed on the machine running this script.
+#     For RHEL / CentOS     yum install perl
+#     For Debian / Ubuntu   apt install perl
+#
+#  It is assumed that this script is being run as a low-privileged user (typically nagios), and that 
+#  typical user permissions are sufficient to run the commands in this script.
+#
+#
+
+# NOTES ON SYSTEMD
+# ----------------
+
+
+
+
+# TROUBLESHOOTING
+# ---------------
+
+
+
+use strict;						#enforce good coding practices
+use Getopt::Long;                       		#allow --long-switches to be used as parameters
+
+#declare variables
+my ($verbose,$cmd,$key,$count_added,$count_removed,$group_name,$group_id,$group_members);
+my (@removed,@added,@same);
+my ($remove_script,$add_script,$same_script);
+my (%current_members,%previous_members);
+my ($uname,$getent);
+my ($common_output_data,$perf_data);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
+my ($config_file,$cache_file);
+my ($opt_h,$opt_v,$opt_g);
+$verbose            = "no";				#yes/no flag to increase verbosity during debugging
+$common_output_data = "";                               #nagios output
+$perf_data          = "";                               #nagios performance data included in output
+$CHECK_NAME         = "group";
+$config_file        = "/usr/local/nagios/libexec/check_group.cfg";     #location of optional config file for executing scripts based on group membership changes
+$cache_file         = "/tmp/check_group.cache.tmp";     #location of file caching the results from the last script invocation
+$count_added        = 0;				#initialize counter variable
+$count_removed      = 0;				#initialize counter variable
+
+#
+# Nagios return codes
+#
+$OK=		0;
+$WARN=		1;
+$CRITICAL=	2;
+$UNKNOWN=	3;
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "Running get_options subroutine \n" if ($verbose eq "yes");
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"     => \$opt_h,
+      "v"   => \$opt_v, "verbose"  => \$opt_v,
+      "g=s" => \$opt_g, "group=s"  => \$opt_g,
+   );
+   #
+   # If the user supplied the -h or --help switch, give them some help.
+   #
+   if( defined( $opt_h ) ) {
+      print "Use this syntax \n";
+      print "   $0 \n";
+      print "   $0 --verbose             (increase output for debugging \n";
+      print "   $0 --group=MyTestGroupe \n";
+      exit $CRITICAL;				#exit script
+   }
+   #
+   # If the user supplied the --verbose switch, increase output verbosity
+   #
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   } else {
+      $verbose = "no";
+   }
+   #
+   # If the user supplied the --group switch, increase output verbosity
+   #
+   if( defined( $opt_g ) ) {
+      $group_name = $opt_g;
+      print "   using group name $group_name \n" if ($verbose eq "yes");
+   } else {
+      print "$CHECK_NAME UNKNOWN: use this syntax:  $0 --group=MyTestGroup \n";
+      exit $UNKNOWN;
+   }
+}                       #end of subroutine
+
+
+
+
+sub sanity_checks {
+   #
+   print "Running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm ps binary exists and is executable
+   # figure out where the getent command is on this system (varies across UNIX flavors)
+   $getent = "/bin/getent";		
+   $getent = "/bin/getent"      if ( -e "/bin/getent");		
+   $getent = "/sbin/getent"     if ( -e "/sbin/getent");		
+   $getent = "/usr/bin/getent"  if ( -e "/usr/bin/getent");		
+   $getent = "/usr/sbin/getent" if ( -e "/usr/sbin/getent");		
+   if ( ! -e $getent ) {
+      print "ERROR: Cannot find $getent binary \n";
+      exit $CRITICAL;
+   }
+   print "   found getent binary at $getent \n" if ($verbose eq "yes");
+   #
+   # confirm uname binary exists and is executable
+   # figure out where the uname command is on this system (varies across UNIX flavors)
+   $uname = "/bin/uname"      if ( -e "/bin/uname");	
+   $uname = "/sbin/uname"     if ( -e "/sbin/uname");	
+   $uname = "/usr/bin/uname"  if ( -e "/usr/bin/uname");	
+   $uname = "/usr/sbin/uname" if ( -e "/usr/sbin/uname");	
+   if ( ! -e $uname ) {
+      print "ERROR: Cannot find $uname binary \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $uname ) {
+      print "ERROR: $uname is not executable by the current user \n";
+      exit $CRITICAL;
+   }
+   print "   found uname binary at $uname \n" if ($verbose eq "yes");
+}						#end of subroutine
+
+
+
+
+sub read_config_file {
+   #
+   # This subroutine reads an *optional* config file that contains directives to execute external scripts when membership changes are detected
+   # A sample config file looks like the following:
+   #
+   # # Uncomment the following lines to execute external scripts when a group membership change is detected.
+   # #add_script=/path/to/script/if/member/added
+   # #remove_script=/path/to/script/if/member/removed
+   # #same_script=/path/to/script/if/member/unchanged
+   #
+   print "Running read_config_file subroutine \n" if ($verbose eq "yes");
+   #
+   if ( ! -f "$config_file" ) {                                                                 #confirm the config file exists
+      print "   config file $config_file does not exist, using default settings. \n" if ($verbose eq "yes");
+   }                                                                                            #end of if block
+   if ( -z "$config_file" ) {                                                                   #confirm the config file is larger than zero bytes
+      print "   config file $config_file exists but is zero size, using default settings \n" if ($verbose eq "yes");
+   }                                                                                            #end of if block
+   if ( -f "$config_file" ) {                                                                   #confirm the config file exists
+      open(IN,"$config_file") or die "Cannot read config file $config_file $! \n";              #open file for reading
+      while (<IN>) {                                                                            #read a line from the command output
+         #
+         # look for a line in the config file similar to
+         #
+         if (/^add_script=(.*)/){                                                           	#find the line in the config file
+            $add_script = $1;
+            print "   found script to execute when members added to group: $add_script \n" if ($verbose eq "yes");
+            # confirm the file exists and is executable
+            if ( ! -f "$add_script" ) {
+               print "$CHECK_NAME UNKNOWN: Cannot find external script $add_script defined in config file $config_file \n";
+               exit $UNKNOWN;
+            }
+            if ( ! -x "$add_script" ) {
+               print "$CHECK_NAME UNKNOWN: external script $add_script defined in config file $config_file exists but is not executable, please check permissions \n";
+               exit $UNKNOWN;
+            }
+         }                                                                                      #end of if block
+         if (/^remove_script=(.*)/){                                                           	#find the line in the config file
+            $remove_script = $1;
+            print "   found script to execute when members removed from group: $remove_script \n" if ($verbose eq "yes");
+            # confirm the file exists and is executable
+            if ( ! -f "$remove_script" ) {
+               print "$CHECK_NAME UNKNOWN: Cannot find external script $remove_script defined in config file $config_file \n";
+               exit $UNKNOWN;
+            }
+            if ( ! -x "$remove_script" ) {
+               print "$CHECK_NAME UNKNOWN: external script $remove_script defined in config file $config_file exists but is not executable, please check permissions \n";
+               exit $UNKNOWN;
+            }
+         }                                                                                      #end of if block
+         if (/^same_script=(.*)/){                                                           	#find the line in the config file
+            $same_script = $1;
+            print "   found script to execute when members are unchanged: $same_script \n" if ($verbose eq "yes");
+            # confirm the file exists and is executable
+            if ( ! -f "$same_script" ) {
+               print "$CHECK_NAME UNKNOWN: Cannot find external script $same_script defined in config file $config_file \n";
+               exit $UNKNOWN;
+            }
+            if ( ! -x "$same_script" ) {
+               print "$CHECK_NAME UNKNOWN: external script $same_script defined in config file $config_file exists but is not executable, please check permissions \n";
+               exit $UNKNOWN;
+            }
+         }                                                                                      #end of if block
+      }                                                                                         #end of while loop
+      close IN;                                                                                 #close filehandle
+   }                                                                                            #end of if block
+}
+
+
+
+
+sub determine_os {
+   #
+   print "Running determine_os subroutine \n" if ($verbose eq "yes");
+   #
+   $cmd = "$uname";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #open filehandle using command output
+   while (<IN>) {                                                       #read a line from the command output
+      unless (/Linux/) {
+         print "ERROR: Cannot determine operating system from output of $uname command \n";
+         exit $UNKNOWN;
+      } 								#end of unless block
+   }									#end of while loop
+   print "   operating system is Linux \n" if ($verbose eq "yes");
+}						#end of subroutine
+
+
+
+
+
+sub get_current_group_membership {
+   #
+   print "Running get_current_group_membership subroutine \n" if ($verbose eq "yes");
+   #
+   #  RHEL   derivatives call the the ssh daemon:  sshd.service  OpenSSH server daemon
+   #  Debian derivatives call the the ssh daemon:  ssh.service   OpenBSD Secure Shell server
+   #
+   # Command output looks similar to:
+   # # getent group MyTestGroup1
+   # mytestgroup1:*:835818653:mytestuser4,mytestuser3,mytestuser1
+   #
+   $cmd = "$getent group $group_name";
+   print "   running command: $cmd \n" if ($verbose eq "yes");
+   open(IN,"$cmd |");                                                   #open filehandle using command output
+   while (<IN>) {                                                       #read a line from the command output
+      print "   $_" if ($verbose eq "yes");
+      if (/^([a-zA-Z0-9_\-]+):(\*):([0-9]+):([a-zA-Z0-9_,\-]+)$/)  { 
+	 print "   found group name $1 with members $4 \n" if ($verbose eq "yes");	
+         #
+         $group_id      = $3;					#save value in case we need to write out cache file
+         $group_members = $4;					#save value in case we need to write out cache file
+         # parse out the the members and save each username as a hash key
+	 print "   splitting members $4 into hash keys \n" if ($verbose eq "yes");	
+         %current_members = map { $_ => 1 } split /,/, $4;
+      }
+   }									#end of while loop
+   close IN;								#close filehandle
+   #
+   # if a cached copy of the group membership does not already exist, create now
+   #
+   if ( ! -f "$cache_file" ) {
+      print "   cache file $cache_file does not already exist, creating now. \n" if ($verbose eq "yes");
+      open (OUT,">$cache_file") or warn "Cannot open $cache_file for writing $! \n";
+      print OUT "$group_name:*:$group_id:$group_members\n";
+   }
+   # 
+   # confirm the cache file exists
+   #
+   if ( ! -f "$cache_file" ) {
+      print "$CHECK_NAME WARN: Cannot create cache file $cache_file, please check permissions \n";
+      exit $WARN;
+   }
+}									#end of subroutine
+
+
+
+
+sub get_previous_group_membership {
+   #
+   print "Running get_previous_group_membership subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm cache file exists from prior execution of this script
+   #
+   if ( ! -f "$cache_file" ) {
+      print "$CHECK_NAME WARN: cache file $cache_file does not exist, please check permissions \n";
+      exit $WARN;
+   }
+   #
+   # read previous group memberships from cache file
+   #
+   print "   opening cache file $cache_file for reading \n" if ($verbose eq "yes");
+   open(IN,"$cache_file");                                                   #open filehandle 
+   while (<IN>) {                                                       #read a line from the file
+      print "   $_" if ($verbose eq "yes");
+      if (/^([a-zA-Z0-9_\-]+):(\*):([0-9]+):([a-zA-Z0-9_,\-]+)$/)  { 
+	 print "   found group name $1 with members $4 \n" if ($verbose eq "yes");	
+         #
+         # parse out the the members and save each username as a hash key
+	 print "   splitting members $4 into hash keys \n" if ($verbose eq "yes");	
+         %previous_members = map { $_ => 1 } split /,/, $4;
+      }
+   }									#end of while loop
+   close IN;								#close filehandle
+}									#end of subroutine
+
+
+
+sub check_for_changes {
+   #
+   print "Running check_for_changes subroutine \n" if ($verbose eq "yes");
+   #
+   # This subroutine looks at the contents of %current_members and %previous_members
+   # and detects and changes in group membership.
+   #
+   @removed = grep { ! exists $current_members{$_}  } keys %previous_members;
+   @added   = grep { ! exists $previous_members{$_} } keys %current_members;
+   @same    = grep {   exists $previous_members{$_} } keys %current_members;
+   #
+   if ($#added   >= 0) { print "   Added:@added     \n" if ($verbose eq "yes"); }
+   if ($#removed >= 0) { print "   Removed:@removed \n" if ($verbose eq "yes"); }
+   if ($#same    >= 0) { print "   Unchanged:@same  \n" if ($verbose eq "yes"); }
+}									#end of subroutine
+
+
+sub update_cache {
+   #
+   print "Running update_cache subroutine \n" if ($verbose eq "yes");
+   #
+   # Delete the $cache_file from the previous run of the script and save the current group membership to the cache file
+   #
+   if ( -f "$cache_file" ) {
+      print "   Removing old cache file $cache_file \n" if ($verbose eq "yes");
+      unlink "$cache_file";
+   }
+   if ( -f "$cache_file" ) {
+      print "$CHECK_NAME WARN: cannot delete cache file $cache_file , please check permissions";
+      exit $WARN;
+   }
+   #
+   # create fresh $cache_file
+   #
+   if ( ! -f "$cache_file" ) {
+      print "   Creating new cache file $cache_file \n" if ($verbose eq "yes");
+      open (OUT,">$cache_file") or warn "Cannot open $cache_file for writing $! \n";
+      print OUT "$group_name:*:$group_id:$group_members\n";
+   }
+   # 
+   # confirm the cache file exists
+   #
+   if ( ! -f "$cache_file" ) {
+      print "$CHECK_NAME WARN: Cannot create cache file $cache_file, please check permissions \n";
+      exit $WARN;
+   }
+}									#end of subroutine
+
+
+
+sub print_output {
+   #
+   print "Running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   $perf_data = "";				#initialize variable
+   $common_output_data = "";			#initialize variable
+   #
+   #
+   print "   Added:@added Removed:@removed Same:@same \n" if ($verbose eq "yes");
+   print "   Added:$#added Removed:$#removed Same:$#same \n" if ($verbose eq "yes");
+   # print any problems that were found
+   #
+   if ($#added   >= 0) { $common_output_data = "$common_output_data Added:@added"; }
+   if ($#removed >= 0) { $common_output_data = "$common_output_data Removed:@removed"; }
+   if ( ($#added >= 0) || ($#removed >= 0) ) {
+      print "$CHECK_NAME $group_name WARN Membership change detected. $common_output_data Unchanged:@same | $perf_data \n";
+      exit $WARN;
+   }
+   #
+   # we should only get this far if everything is good
+   #
+   if ( ($#added <= 0) && ($#removed <= 0) ) {
+      $common_output_data = "no group membership changes detected. Unchanged:@same ";
+      print "$CHECK_NAME $group_name OK $common_output_data | $perf_data \n";
+      exit $OK;
+   }
+}															#end of subroutine
+
+
+
+
+# ---------------- main body of script -------------------------
+get_options;
+sanity_checks;
+read_config_file;
+determine_os;
+get_current_group_membership;
+get_previous_group_membership;
+check_for_changes;
+update_cache;
+print_output;
+
