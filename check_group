@@ -4,6 +4,7 @@
 # -------------------
 # Add functionality to allow spaces in usernames and/or groups
 # Test additional UNIX/Linux flavours
+# Add optionaly functionality to log to syslog using /usr/bin/logger
 
 
  
@@ -81,7 +82,7 @@ my ($verbose,$cmd,$key,$count_added,$count_removed,$group_name,$group_id,$group_
 my (@removed,@added,@same);
 my ($remove_script,$add_script,$same_script);
 my (%current_members,%previous_members);
-my ($uname,$getent);
+my ($uname,$getent,$logger,$log_to_syslog);
 my ($common_output_data,$perf_data);
 my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
 my ($config_file,$cache_file);
@@ -91,9 +92,11 @@ $common_output_data = "";                               #nagios output
 $perf_data          = "";                               #nagios performance data included in output
 $CHECK_NAME         = "group";
 $config_file        = "/usr/local/nagios/libexec/check_group.cfg";     #location of optional config file for executing scripts based on group membership changes
+$config_file        = "/var/lib/edb/scripts/check_group.cfg";     #location of optional config file for executing scripts based on group membership changes
 $cache_file         = "/tmp/check_group.cache.tmp";     #location of file caching the results from the last script invocation
 $count_added        = 0;				#initialize counter variable
 $count_removed      = 0;				#initialize counter variable
+$log_to_syslog      = "yes";				#yes|no flag to log script output to syslog
 
 #
 # Nagios return codes
@@ -182,6 +185,22 @@ sub sanity_checks {
       exit $CRITICAL;
    }
    print "   found uname binary at $uname \n" if ($verbose eq "yes");
+   #
+   # confirm logger binary exists and is executable
+   # figure out where the logger command is on this system (varies across UNIX flavors)
+   $logger = "/bin/logger"      if ( -e "/bin/logger");	
+   $logger = "/sbin/logger"     if ( -e "/sbin/logger");	
+   $logger = "/usr/bin/logger"  if ( -e "/usr/bin/logger");	
+   $logger = "/usr/sbin/logger" if ( -e "/usr/sbin/logger");	
+   if ( ! -e $logger ) {
+      print "ERROR: Cannot find $logger binary \n";
+      exit $CRITICAL;
+   }
+   if ( ! -x $logger ) {
+      print "ERROR: $logger is not executable by the current user \n";
+      exit $CRITICAL;
+   }
+   print "   found logger binary at $logger \n" if ($verbose eq "yes");
 }						#end of subroutine
 
 
@@ -277,7 +296,6 @@ sub determine_os {
 
 
 
-
 sub get_current_group_membership {
    #
    print "Running get_current_group_membership subroutine \n" if ($verbose eq "yes");
@@ -288,6 +306,9 @@ sub get_current_group_membership {
    # Command output looks similar to:
    # # getent group MyTestGroup1
    # mytestgroup1:*:835818653:mytestuser4,mytestuser3,mytestuser1
+   #
+   $group_id      = "notfound";					#initialize variable with dummy value to avoid undef error
+   $group_members = "notfound";					#initialize variable with dummy value to avoid undef error
    #
    $cmd = "$getent group $group_name";
    print "   running command: $cmd \n" if ($verbose eq "yes");
@@ -355,6 +376,7 @@ sub get_previous_group_membership {
 
 
 
+
 sub check_for_changes {
    #
    print "Running check_for_changes subroutine \n" if ($verbose eq "yes");
@@ -369,7 +391,36 @@ sub check_for_changes {
    if ($#added   >= 0) { print "   Added:@added     \n" if ($verbose eq "yes"); }
    if ($#removed >= 0) { print "   Removed:@removed \n" if ($verbose eq "yes"); }
    if ($#same    >= 0) { print "   Unchanged:@same  \n" if ($verbose eq "yes"); }
+   #
+   # if there are any external scripts specified in the $config_file , execute those scripts for each membership change
+   #
+   if ( (defined($add_script)) && (-x "$add_script") && ($#added >= 0) ) {
+      print "   Added:@added     \n" if ($verbose eq "yes");
+      foreach (@added) {
+         print "   running script $add_script $_ \n" if ($verbose eq "yes");
+         system("$logger \"$0 $add_script $_\"") if ($log_to_syslog eq "yes");	#log to syslog
+         system("$add_script $_");  						#execute external script for added user
+      }
+   }
+   if ( (defined($remove_script)) && (-x "$remove_script") && ($#removed >= 0) ) {
+      print "   Added:@removed     \n" if ($verbose eq "yes");
+      foreach (@removed) {
+         print "   running script $remove_script $_ \n" if ($verbose eq "yes");
+         system("$logger \"$0 $remove_script $_\"") if ($log_to_syslog eq "yes");	#log to syslog
+         system("$remove_script $_");  							#execute external script for removed user
+      }
+   }
+   if ( (defined($same_script)) && (-x "$same_script") && ($#same >= 0) ) {
+      print "   Added:@same     \n" if ($verbose eq "yes");
+      foreach (@same) {
+         print "   running script $same_script $_ \n" if ($verbose eq "yes");
+         system("$logger \"$0 $same_script $_\"") if ($log_to_syslog eq "yes");	#log to syslog
+         system("$same_script $_");  			#execute external script for unchanged user
+      }
+   }
 }									#end of subroutine
+
+
 
 
 sub update_cache {
@@ -405,6 +456,7 @@ sub update_cache {
 
 
 
+
 sub print_output {
    #
    print "Running print_output subroutine \n" if ($verbose eq "yes");
@@ -413,13 +465,23 @@ sub print_output {
    $common_output_data = "";			#initialize variable
    #
    #
-   print "   Added:@added Removed:@removed Same:@same \n" if ($verbose eq "yes");
+   print "   Added:@added  Removed:@removed  Same:@same  \n" if ($verbose eq "yes");
    print "   Added:$#added Removed:$#removed Same:$#same \n" if ($verbose eq "yes");
+   #
+   # alert if the group name was not found
+   #
+   if ($group_id eq "notfound") {
+      system("$logger \"$0 WARN Could not find group $group_name , please investigate.\"") if ($log_to_syslog eq "yes");  #log to syslog
+      print "$CHECK_NAME WARN Could not find group $group_name , please investigate. | $perf_data \n";
+      exit $WARN;
+   }
+   #
    # print any problems that were found
    #
    if ($#added   >= 0) { $common_output_data = "$common_output_data Added:@added"; }
    if ($#removed >= 0) { $common_output_data = "$common_output_data Removed:@removed"; }
    if ( ($#added >= 0) || ($#removed >= 0) ) {
+      system("$logger \"$0 WARN Membership change detected.  $common_output_data Unchanged:@same \"") if ($log_to_syslog eq "yes");  #log to syslog
       print "$CHECK_NAME $group_name WARN Membership change detected. $common_output_data Unchanged:@same | $perf_data \n";
       exit $WARN;
    }
