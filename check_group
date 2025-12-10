@@ -11,6 +11,8 @@
 # CHANGE LOG
 # ----------
 #  2025/12/04	njeffrey	Script created
+#  2025/12/10	njeffrey	Regex bug fix, add . as a valid character in usernames
+#  2025/12/10	njeffrey	Regex bug fix, add @ as a valid character in Active Directory group names 
 
 
 # NOTES
@@ -305,7 +307,7 @@ sub get_current_group_membership {
    #
    # Command output looks similar to:
    # # getent group MyTestGroup1
-   # mytestgroup1:*:835818653:mytestuser4,mytestuser3,mytestuser1
+   # mytestgroup1:*:835818653:mytestuser4,mytestuser3,mytestuser1,jane.doe,John_Smith,FirstName-LastName
    #
    $group_id      = "notfound";					#initialize variable with dummy value to avoid undef error
    $group_members = "notfound";					#initialize variable with dummy value to avoid undef error
@@ -315,7 +317,7 @@ sub get_current_group_membership {
    open(IN,"$cmd |");                                                   #open filehandle using command output
    while (<IN>) {                                                       #read a line from the command output
       print "   $_" if ($verbose eq "yes");
-      if (/^([a-zA-Z0-9_\-]+):(\*):([0-9]+):([a-zA-Z0-9_,\-]+)$/)  { 
+      if (/^([a-zA-Z0-9_\-\@\.]+):(\*):([0-9]+):([a-zA-Z0-9_,\-\.]+)$/)  { 
 	 print "   found group name $1 with members $4 \n" if ($verbose eq "yes");	
          #
          $group_id      = $3;					#save value in case we need to write out cache file
@@ -363,7 +365,7 @@ sub get_previous_group_membership {
    open(IN,"$cache_file");                                                   #open filehandle 
    while (<IN>) {                                                       #read a line from the file
       print "   $_" if ($verbose eq "yes");
-      if (/^([a-zA-Z0-9_\-]+):(\*):([0-9]+):([a-zA-Z0-9_,\-]+)$/)  { 
+      if (/^([a-zA-Z0-9_\-\@\.]+):(\*):([0-9]+):([a-zA-Z0-9_,\-\.]+)$/)  { 
 	 print "   found group name $1 with members $4 \n" if ($verbose eq "yes");	
          #
          # parse out the the members and save each username as a hash key
@@ -481,15 +483,15 @@ sub print_output {
    if ($#added   >= 0) { $common_output_data = "$common_output_data Added:@added"; }
    if ($#removed >= 0) { $common_output_data = "$common_output_data Removed:@removed"; }
    if ( ($#added >= 0) || ($#removed >= 0) ) {
-      system("$logger \"$0 WARN Membership change detected.  $common_output_data Unchanged:@same \"") if ($log_to_syslog eq "yes");  #log to syslog
-      print "$CHECK_NAME $group_name WARN Membership change detected. $common_output_data Unchanged:@same | $perf_data \n";
+      system("$logger \"$0 WARN Membership change detected.  $common_output_data \"") if ($log_to_syslog eq "yes");  #log to syslog
+      print "$CHECK_NAME $group_name WARN Membership change detected. $common_output_data | $perf_data \n";
       exit $WARN;
    }
    #
    # we should only get this far if everything is good
    #
    if ( ($#added <= 0) && ($#removed <= 0) ) {
-      $common_output_data = "no group membership changes detected. Unchanged:@same ";
+      $common_output_data = "no group membership changes detected.";
       print "$CHECK_NAME $group_name OK $common_output_data | $perf_data \n";
       exit $OK;
    }
