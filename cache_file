@@ -13,6 +13,7 @@
 #  2025/12/04	njeffrey	Script created
 #  2025/12/10	njeffrey	Regex bug fix, add . as a valid character in usernames
 #  2025/12/10	njeffrey	Regex bug fix, add @ as a valid character in Active Directory group names 
+#  2026/01/22	njeffrey	Embed $group_name in $cache_file filename to ensure cache file is unique
 
 
 # NOTES
