@@ -145,6 +145,7 @@ sub get_options {
    #
    if( defined( $opt_g ) ) {
       $group_name = $opt_g;
+      $cache_file = "/tmp/check_group.$group_name.cache.tmp";     #update the cache file name to be unique for a specific group
       print "   using group name $group_name \n" if ($verbose eq "yes");
    } else {
       print "$CHECK_NAME UNKNOWN: use this syntax:  $0 --group=MyTestGroup \n";
